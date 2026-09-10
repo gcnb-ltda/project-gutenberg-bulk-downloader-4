@@ -19,7 +19,7 @@ done
 mkdir -p "$OUT_DIR"
 
 python3 - "$STATE_FILE" "$INDEX_FILE" "$OUT_DIR" "$RUN_TARGET_MIB" "$REPO_TARGET_GIB" "$MAX_TEXT_MIB" "$MAX_ZIP_MIB" "$PUSH_BATCH_MIB" "$CHECKPOINT_PAGES" "$REQUEST_DELAY_SECONDS" "$MAX_PAGES_PER_RUN" <<'PY'
-import hashlib, html, io, json, os, re, subprocess, sys, time, urllib.parse, urllib.request, zipfile
+import hashlib, html, io, json, os, re, subprocess, sys, time, urllib.parse, urllib.request, urllib.error, zipfile
 from html.parser import HTMLParser
 
 (
@@ -44,6 +44,9 @@ total_bytes=int(state.get('total_bytes_repo',0))
 total_files=int(state.get('total_files_repo',0))
 pages_processed=int(state.get('pages_processed',0))
 
+if bool(state.get('complete',False)):
+    print(f'Harvest already marked complete at offset {offset}.')
+    raise SystemExit(0)
 if total_bytes >= repo_target:
     print(f'Repository target reached: {total_bytes} bytes')
     raise SystemExit(0)
@@ -54,22 +57,32 @@ batch_files=0
 pages_this_run=0
 last_request_at=0.0
 
-UA='GCNB-Project-Gutenberg-Archiver/1.0 (+https://github.com/gcnb-ltda/project-gutenberg-bulk-downloader-4)'
+UA='GCNB-Project-Gutenberg-Archiver/1.1 (+https://github.com/gcnb-ltda/project-gutenberg-bulk-downloader-4)'
 
-def polite_get(url):
+def polite_get(url, attempts=4):
     global last_request_at
-    wait=delay-(time.time()-last_request_at)
-    if wait>0: time.sleep(wait)
-    req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'*/*'})
-    with urllib.request.urlopen(req,timeout=120) as r:
-        clen=r.headers.get('Content-Length')
-        if clen and int(clen)>max_zip and url.lower().endswith('.zip'):
-            raise ValueError(f'archive too large: {clen} bytes')
-        data=r.read(max_zip+1 if url.lower().endswith('.zip') else None)
-    last_request_at=time.time()
-    if url.lower().endswith('.zip') and len(data)>max_zip:
-        raise ValueError(f'archive too large: {len(data)} bytes')
-    return data
+    last_error=None
+    for attempt in range(1,attempts+1):
+        wait=delay-(time.time()-last_request_at)
+        if wait>0: time.sleep(wait)
+        try:
+            req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'*/*'})
+            with urllib.request.urlopen(req,timeout=120) as r:
+                clen=r.headers.get('Content-Length')
+                if clen and int(clen)>max_zip and url.lower().endswith('.zip'):
+                    raise ValueError(f'archive too large: {clen} bytes')
+                data=r.read(max_zip+1 if url.lower().endswith('.zip') else None)
+            last_request_at=time.time()
+            if url.lower().endswith('.zip') and len(data)>max_zip:
+                raise ValueError(f'archive too large: {len(data)} bytes')
+            return data
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+            last_error=e
+            last_request_at=time.time()
+            if attempt>=attempts:
+                break
+            time.sleep(min(30,5*attempt))
+    raise last_error
 
 class HarvestParser(HTMLParser):
     def __init__(self):
@@ -79,7 +92,7 @@ class HarvestParser(HTMLParser):
         href=dict(attrs).get('href')
         if href: self.links.append(html.unescape(href))
 
-def parse_page(raw,base_url):
+def parse_page(raw,base_url,current_offset):
     text=raw.decode('utf-8','replace')
     p=HarvestParser(); p.feed(text)
     zips=[]; next_offset=None
@@ -92,9 +105,12 @@ def parse_page(raw,base_url):
             if 'offset' in q:
                 try:
                     cand=int(q['offset'][0])
-                    if cand>offset and (next_offset is None or cand<next_offset): next_offset=cand
-                except Exception: pass
-    return zips,next_offset
+                    if cand>current_offset and (next_offset is None or cand<next_offset):
+                        next_offset=cand
+                except Exception:
+                    pass
+    no_more=bool(re.search(r'\bNo\s+more\s+files\.?\b',text,re.I))
+    return zips,next_offset,no_more,text
 
 def ebook_id_and_rank(url):
     name=os.path.basename(urllib.parse.urlparse(url).path).lower()
@@ -161,10 +177,28 @@ while run_bytes < run_target and total_bytes < repo_target and pages_this_run < 
     if offset: page_url += '&offset='+str(offset)
     print('Harvest page:',page_url,flush=True)
     page=polite_get(page_url)
-    urls,next_offset=parse_page(page,page_url)
+    urls,next_offset,no_more,page_text=parse_page(page,page_url,offset)
     chosen=choose_urls(urls)
+
     if not chosen:
-        raise RuntimeError(f'No TXT ZIP links found at offset {offset}')
+        if no_more:
+            pages_this_run += 1
+            pages_processed += 1
+            save_state(offset,complete=True)
+            git_commit(f'Complete Project Gutenberg TXT harvest at offset {offset}')
+            print(f'Robot Harvest reached official end of list at offset {offset}.')
+            raise SystemExit(0)
+        if next_offset is not None and next_offset>offset:
+            print(f'Warning: no TXT ZIP links at offset {offset}; advancing to {next_offset}.',flush=True)
+            pages_this_run += 1
+            pages_processed += 1
+            offset=next_offset
+            save_state(offset,complete=False)
+            if pages_this_run % checkpoint_pages == 0:
+                git_commit(f'Advance Project Gutenberg TXT harvest through offset {offset}')
+            continue
+        preview=' '.join(re.sub(r'<[^>]+>',' ',page_text).split())[:500]
+        raise RuntimeError(f'No TXT ZIP links and no end-of-list marker at offset {offset}. Page preview: {preview}')
 
     for gid,url in chosen:
         dst=os.path.join(out_dir,f'{gid}.txt')
@@ -184,12 +218,16 @@ while run_bytes < run_target and total_bytes < repo_target and pages_this_run < 
         total_bytes += len(data); total_files += 1; run_bytes += len(data); batch_bytes += len(data); batch_files += 1
         if run_bytes>=run_target or total_bytes>=repo_target: break
 
-    pages_this_run += 1; pages_processed += 1
+    pages_this_run += 1
+    pages_processed += 1
     if next_offset is None:
-        save_state(offset,complete=True)
-        git_commit(f'Complete Project Gutenberg TXT harvest at offset {offset}')
-        print('Robot Harvest completed.')
-        raise SystemExit(0)
+        if no_more:
+            save_state(offset,complete=True)
+            git_commit(f'Complete Project Gutenberg TXT harvest at offset {offset}')
+            print('Robot Harvest completed.')
+            raise SystemExit(0)
+        raise RuntimeError(f'Harvest page at offset {offset} had TXT links but no next offset and no end-of-list marker.')
+
     offset=next_offset
     save_state(offset,complete=False)
 
