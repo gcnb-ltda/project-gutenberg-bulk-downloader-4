@@ -1,10 +1,8 @@
 {
   "collection": "Project Gutenberg main TXT",
-  "previous_repository": null,
-  "first_id_exclusive": 0,
-  "last_id": 0,
-  "total_bytes_repo": 0,
-  "total_files_repo": 0,
-  "complete": false,
-  "note": "Clean TXT baseline. Repository 3 checkpoint was not reused because its earlier parser admitted non-book TXT files."
+  "last_id": 66096,
+  "total_bytes_repo": 13289,
+  "total_files_repo": 33,
+  "max_discovered_id": 66096,
+  "complete": false
 }
