@@ -1,9 +1,10 @@
 {
   "collection": "Project Gutenberg main TXT",
-  "previous_repository": "gcnb-ltda/project-gutenberg-bulk-downloader-3",
-  "first_id_exclusive": 79549,
-  "last_id": 79549,
+  "previous_repository": null,
+  "first_id_exclusive": 0,
+  "last_id": 0,
   "total_bytes_repo": 0,
   "total_files_repo": 0,
-  "complete": false
+  "complete": false,
+  "note": "Clean TXT baseline. Repository 3 checkpoint was not reused because its earlier parser admitted non-book TXT files."
 }
