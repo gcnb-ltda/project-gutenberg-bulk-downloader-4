@@ -1,188 +1,203 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RSYNC_SOURCE="${RSYNC_SOURCE:-gutenberg.pglaf.org::gutenberg}"
-RUN_TARGET_MIB="${RUN_TARGET_MIB:-2500}"
+RUN_TARGET_MIB="${RUN_TARGET_MIB:-2000}"
 REPO_TARGET_GIB="${REPO_TARGET_GIB:-8}"
-MAX_FILE_MIB="${MAX_FILE_MIB:-90}"
-PUSH_BATCH_MIB="${PUSH_BATCH_MIB:-400}"
+MAX_TEXT_MIB="${MAX_TEXT_MIB:-90}"
+MAX_ZIP_MIB="${MAX_ZIP_MIB:-100}"
+PUSH_BATCH_MIB="${PUSH_BATCH_MIB:-300}"
+CHECKPOINT_PAGES="${CHECKPOINT_PAGES:-5}"
+REQUEST_DELAY_SECONDS="${REQUEST_DELAY_SECONDS:-2.1}"
+MAX_PAGES_PER_RUN="${MAX_PAGES_PER_RUN:-40}"
 STATE_FILE="${STATE_FILE:-txt-continuation-state.json}"
-INDEX_FILE="${INDEX_FILE:-txt-index.tsv}"
+INDEX_FILE="${INDEX_FILE:-txt-harvest-index.tsv}"
 OUT_DIR="${OUT_DIR:-books_txt}"
 
-RUN_TARGET_BYTES=$((RUN_TARGET_MIB * 1024 * 1024))
-REPO_TARGET_BYTES=$((REPO_TARGET_GIB * 1024 * 1024 * 1024))
-MAX_FILE_BYTES=$((MAX_FILE_MIB * 1024 * 1024))
-PUSH_BATCH_BYTES=$((PUSH_BATCH_MIB * 1024 * 1024))
-
-for c in rsync python3 git cp; do
+for c in python3 git; do
   command -v "$c" >/dev/null 2>&1 || { echo "ERROR: $c is required" >&2; exit 1; }
 done
 mkdir -p "$OUT_DIR"
 
-readarray -t STATE < <(python3 - "$STATE_FILE" <<'PY'
-import json,sys
+python3 - "$STATE_FILE" "$INDEX_FILE" "$OUT_DIR" "$RUN_TARGET_MIB" "$REPO_TARGET_GIB" "$MAX_TEXT_MIB" "$MAX_ZIP_MIB" "$PUSH_BATCH_MIB" "$CHECKPOINT_PAGES" "$REQUEST_DELAY_SECONDS" "$MAX_PAGES_PER_RUN" <<'PY'
+import hashlib, html, io, json, os, re, subprocess, sys, time, urllib.parse, urllib.request, zipfile
+from html.parser import HTMLParser
+
+(
+    state_file,index_file,out_dir,run_target_mib,repo_target_gib,max_text_mib,
+    max_zip_mib,push_batch_mib,checkpoint_pages,delay_s,max_pages_per_run
+)=sys.argv[1:]
+run_target=int(run_target_mib)*1024*1024
+repo_target=int(repo_target_gib)*1024*1024*1024
+max_text=int(max_text_mib)*1024*1024
+max_zip=int(max_zip_mib)*1024*1024
+push_batch=int(push_batch_mib)*1024*1024
+checkpoint_pages=int(checkpoint_pages)
+delay=float(delay_s)
+max_pages=int(max_pages_per_run)
+
 try:
-    d=json.load(open(sys.argv[1],encoding='utf-8'))
+    state=json.load(open(state_file,encoding='utf-8'))
 except Exception:
-    d={}
-print(int(d.get('last_id',0)))
-print(int(d.get('total_bytes_repo',0)))
-print(int(d.get('total_files_repo',0)))
-PY
-)
-LAST_ID="${STATE[0]:-0}"
-TOTAL_BYTES="${STATE[1]:-0}"
-TOTAL_FILES="${STATE[2]:-0}"
+    state={}
+offset=int(state.get('harvest_offset',0))
+total_bytes=int(state.get('total_bytes_repo',0))
+total_files=int(state.get('total_files_repo',0))
+pages_processed=int(state.get('pages_processed',0))
 
-if (( TOTAL_BYTES >= REPO_TARGET_BYTES )); then
-  echo "Repository target already reached: $TOTAL_BYTES bytes"
-  exit 0
-fi
+if total_bytes >= repo_target:
+    print(f'Repository target reached: {total_bytes} bytes')
+    raise SystemExit(0)
 
-REMAINING=$((REPO_TARGET_BYTES - TOTAL_BYTES))
-if (( RUN_TARGET_BYTES > REMAINING )); then RUN_TARGET_BYTES="$REMAINING"; fi
-
-echo "Listing Project Gutenberg main collection from $RSYNC_SOURCE ..."
-rsync -r --list-only --timeout=600 "$RSYNC_SOURCE" > /tmp/gutenberg-main-list.txt
-
-python3 - "$LAST_ID" "$RUN_TARGET_BYTES" "$MAX_FILE_BYTES" <<'PY'
-import os,re,sys
-last_id=int(sys.argv[1]); target=int(sys.argv[2]); max_file=int(sys.argv[3])
-books={}
-all_ids=set()
-for line in open('/tmp/gutenberg-main-list.txt',encoding='utf-8',errors='replace'):
-    parts=line.split()
-    if len(parts)<5:
-        continue
-    try:
-        size=int(parts[1])
-    except ValueError:
-        continue
-    path=parts[-1].lstrip('./')
-    name=os.path.basename(path).lower()
-
-    # Accept only text files named after the actual Gutenberg ebook ID.
-    # Examples: 12345-0.txt (preferred UTF-8), 12345.txt, 12345-8.txt.
-    m=re.fullmatch(r'(\d+)(?:-(\d+))?\.txt', name)
-    if not m:
-        continue
-    gid=int(m.group(1)); suffix=m.group(2)
-    all_ids.add(gid)
-    if gid<=last_id or size<=0 or size>max_file:
-        continue
-
-    if suffix == '0': rank=0
-    elif suffix is None: rank=1
-    else: rank=2
-    cand=(rank,size,path)
-    prev=books.get(gid)
-    if prev is None or cand < prev:
-        books[gid]=cand
-
-selected=[]; total=0
-for gid in sorted(books):
-    rank,size,path=books[gid]
-    if selected and total+size>target:
-        break
-    selected.append((gid,size,path)); total+=size
-
-with open('/tmp/selected.tsv','w',encoding='utf-8') as f:
-    for gid,size,path in selected:
-        f.write(f'{gid}\t{size}\t{path}\n')
-with open('/tmp/selected.paths','w',encoding='utf-8') as f:
-    for _,_,path in selected:
-        f.write(path+'\n')
-with open('/tmp/discovery.meta','w',encoding='utf-8') as f:
-    f.write(f'{len(all_ids)}\n{max(all_ids) if all_ids else 0}\n')
-print(f'discovered_ids={len(all_ids)} max_id={max(all_ids) if all_ids else 0}')
-print(f'selected={len(selected)} bytes={total} last_id={selected[-1][0] if selected else last_id}')
-PY
-
-readarray -t DISCOVERY < /tmp/discovery.meta
-DISCOVERED_COUNT="${DISCOVERY[0]:-0}"
-DISCOVERED_MAX_ID="${DISCOVERY[1]:-0}"
-
-if (( DISCOVERED_COUNT == 0 )); then
-  echo "ERROR: no ebook TXT files were discovered. Refusing to mark collection complete." >&2
-  exit 2
-fi
-
-if [[ ! -s /tmp/selected.paths ]]; then
-  if (( LAST_ID < DISCOVERED_MAX_ID )); then
-    echo "ERROR: no selectable TXT files after ID $LAST_ID although max discovered ID is $DISCOVERED_MAX_ID." >&2
-    exit 3
-  fi
-  python3 - "$STATE_FILE" "$LAST_ID" "$TOTAL_BYTES" "$TOTAL_FILES" "$DISCOVERED_MAX_ID" <<'PY'
-import json,sys
-p,last,b,f,maxid=sys.argv[1:]
-json.dump({'collection':'Project Gutenberg main TXT','last_id':int(last),'total_bytes_repo':int(b),'total_files_repo':int(f),'max_discovered_id':int(maxid),'complete':True},open(p,'w',encoding='utf-8'),indent=2)
-PY
-  git add "$STATE_FILE"
-  git commit -m "Mark Project Gutenberg TXT collection complete" || true
-  git push origin HEAD:main
-  exit 0
-fi
-
-rm -rf /tmp/pg-main
-mkdir -p /tmp/pg-main
-rsync -avR --timeout=600 --files-from=/tmp/selected.paths "$RSYNC_SOURCE" /tmp/pg-main/
-
-[[ -f "$INDEX_FILE" ]] || printf 'gutenberg_id\tbytes\tsource_path\trepo_path\n' > "$INDEX_FILE"
-
+run_bytes=0
 batch_bytes=0
 batch_files=0
-batch_no=1
-current_id="$LAST_ID"
+pages_this_run=0
+last_request_at=0.0
 
-commit_batch() {
-  if (( batch_files == 0 )); then return; fi
-  TOTAL_BYTES=$((TOTAL_BYTES + batch_bytes))
-  TOTAL_FILES=$((TOTAL_FILES + batch_files))
-  python3 - "$STATE_FILE" "$current_id" "$TOTAL_BYTES" "$TOTAL_FILES" "$DISCOVERED_MAX_ID" <<'PY'
-import json,sys
-p,last,b,f,maxid=sys.argv[1:]
-json.dump({'collection':'Project Gutenberg main TXT','last_id':int(last),'total_bytes_repo':int(b),'total_files_repo':int(f),'max_discovered_id':int(maxid),'complete':False},open(p,'w',encoding='utf-8'),indent=2)
+UA='GCNB-Project-Gutenberg-Archiver/1.0 (+https://github.com/gcnb-ltda/project-gutenberg-bulk-downloader-4)'
+
+def polite_get(url):
+    global last_request_at
+    wait=delay-(time.time()-last_request_at)
+    if wait>0: time.sleep(wait)
+    req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'*/*'})
+    with urllib.request.urlopen(req,timeout=120) as r:
+        clen=r.headers.get('Content-Length')
+        if clen and int(clen)>max_zip and url.lower().endswith('.zip'):
+            raise ValueError(f'archive too large: {clen} bytes')
+        data=r.read(max_zip+1 if url.lower().endswith('.zip') else None)
+    last_request_at=time.time()
+    if url.lower().endswith('.zip') and len(data)>max_zip:
+        raise ValueError(f'archive too large: {len(data)} bytes')
+    return data
+
+class HarvestParser(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.links=[]
+    def handle_starttag(self,tag,attrs):
+        if tag!='a': return
+        href=dict(attrs).get('href')
+        if href: self.links.append(html.unescape(href))
+
+def parse_page(raw,base_url):
+    text=raw.decode('utf-8','replace')
+    p=HarvestParser(); p.feed(text)
+    zips=[]; next_offset=None
+    for href in p.links:
+        u=urllib.parse.urljoin(base_url,href)
+        if re.search(r'https://aleph\.gutenberg\.org/.+\.zip$',u,re.I):
+            zips.append(u)
+        if 'gutenberg.org/robot/harvest' in u or href.startswith('?'):
+            q=urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+            if 'offset' in q:
+                try:
+                    cand=int(q['offset'][0])
+                    if cand>offset and (next_offset is None or cand<next_offset): next_offset=cand
+                except Exception: pass
+    return zips,next_offset
+
+def ebook_id_and_rank(url):
+    name=os.path.basename(urllib.parse.urlparse(url).path).lower()
+    m=re.fullmatch(r'(\d+)(?:-(\d+))?\.zip',name)
+    if not m: return None
+    gid=int(m.group(1)); suffix=m.group(2)
+    rank=0 if suffix=='0' else (1 if suffix is None else 2)
+    return gid,rank
+
+def choose_urls(urls):
+    best={}
+    for u in urls:
+        x=ebook_id_and_rank(u)
+        if not x: continue
+        gid,rank=x
+        cur=best.get(gid)
+        if cur is None or (rank,u)<(cur[0],cur[1]): best[gid]=(rank,u)
+    return [(gid,v[1]) for gid,v in sorted(best.items())]
+
+def extract_txt(zip_bytes,gid):
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        candidates=[]
+        for n in z.namelist():
+            if n.endswith('/'): continue
+            base=os.path.basename(n).lower()
+            m=re.fullmatch(rf'{gid}(?:-(\d+))?\.txt',base)
+            if not m: continue
+            suf=m.group(1)
+            rank=0 if suf=='0' else (1 if suf is None else 2)
+            info=z.getinfo(n)
+            if info.file_size<=0 or info.file_size>max_text: continue
+            candidates.append((rank,info.file_size,n))
+        if not candidates: return None,None
+        candidates.sort()
+        _,_,member=candidates[0]
+        data=z.read(member)
+        if len(data)>max_text: return None,None
+        return member,data
+
+def save_state(next_offset,complete=False):
+    obj={
+      'collection':'Project Gutenberg Robot Harvest TXT',
+      'harvest_offset':int(next_offset),
+      'total_bytes_repo':int(total_bytes),
+      'total_files_repo':int(total_files),
+      'pages_processed':int(pages_processed),
+      'complete':bool(complete)
+    }
+    with open(state_file,'w',encoding='utf-8') as f: json.dump(obj,f,indent=2)
+
+def git_commit(message):
+    subprocess.run(['git','add',state_file,index_file,out_dir],check=True)
+    r=subprocess.run(['git','diff','--cached','--quiet'])
+    if r.returncode==0: return
+    subprocess.run(['git','commit','-m',message],check=True)
+    subprocess.run(['git','push','origin','HEAD:main'],check=True)
+
+if not os.path.exists(index_file):
+    with open(index_file,'w',encoding='utf-8') as f:
+        f.write('gutenberg_id\tbytes\tsha256\tsource_zip\tmember\trepo_path\n')
+
+while run_bytes < run_target and total_bytes < repo_target and pages_this_run < max_pages:
+    page_url='https://www.gutenberg.org/robot/harvest?filetypes%5B%5D=txt'
+    if offset: page_url += '&offset='+str(offset)
+    print('Harvest page:',page_url,flush=True)
+    page=polite_get(page_url)
+    urls,next_offset=parse_page(page,page_url)
+    chosen=choose_urls(urls)
+    if not chosen:
+        raise RuntimeError(f'No TXT ZIP links found at offset {offset}')
+
+    for gid,url in chosen:
+        dst=os.path.join(out_dir,f'{gid}.txt')
+        if os.path.exists(dst):
+            continue
+        try:
+            zb=polite_get(url)
+            member,data=extract_txt(zb,gid)
+            if data is None:
+                print('Skip: no matching TXT in',url,flush=True); continue
+        except Exception as e:
+            print('Skip download/extract error:',url,e,flush=True); continue
+        sha=hashlib.sha256(data).hexdigest()
+        with open(dst,'wb') as f: f.write(data)
+        with open(index_file,'a',encoding='utf-8') as f:
+            f.write(f'{gid}\t{len(data)}\t{sha}\t{url}\t{member}\t{dst}\n')
+        total_bytes += len(data); total_files += 1; run_bytes += len(data); batch_bytes += len(data); batch_files += 1
+        if run_bytes>=run_target or total_bytes>=repo_target: break
+
+    pages_this_run += 1; pages_processed += 1
+    if next_offset is None:
+        save_state(offset,complete=True)
+        git_commit(f'Complete Project Gutenberg TXT harvest at offset {offset}')
+        print('Robot Harvest completed.')
+        raise SystemExit(0)
+    offset=next_offset
+    save_state(offset,complete=False)
+
+    if batch_bytes>=push_batch or pages_this_run % checkpoint_pages == 0:
+        git_commit(f'Add Project Gutenberg TXT harvest through offset {offset}')
+        batch_bytes=0; batch_files=0
+
+save_state(offset,complete=False)
+git_commit(f'Checkpoint Project Gutenberg TXT harvest at offset {offset}')
+print(f'Run complete: added {run_bytes} bytes; repository total {total_bytes} bytes / {total_files} files; next offset {offset}')
 PY
-  git add "$STATE_FILE" "$INDEX_FILE"
-  git commit -m "Add Project Gutenberg TXT batch ${batch_no} through ID ${current_id}"
-  git push origin HEAD:main
-  batch_bytes=0
-  batch_files=0
-  batch_no=$((batch_no + 1))
-}
-
-while IFS=$'\t' read -r gid size path; do
-  [[ -z "${path:-}" ]] && continue
-  src="/tmp/pg-main/$path"
-  if [[ ! -f "$src" ]]; then
-    echo "ERROR: rsync did not produce expected file $src" >&2
-    exit 4
-  fi
-
-  base="$(basename "$path")"
-  if [[ ! "$base" =~ ^${gid}(-[0-9]+)?\.txt$ ]]; then
-    echo "ERROR: basename/ID validation failed: gid=$gid path=$path" >&2
-    exit 5
-  fi
-
-  dst="$OUT_DIR/$gid.txt"
-  cp "$src" "$dst"
-  git add "$dst"
-  printf '%s\t%s\t%s\t%s\n' "$gid" "$size" "$path" "$dst" >> "$INDEX_FILE"
-
-  batch_bytes=$((batch_bytes + size))
-  batch_files=$((batch_files + 1))
-  current_id="$gid"
-
-  if (( batch_bytes >= PUSH_BATCH_BYTES )); then
-    commit_batch
-  fi
-done < /tmp/selected.tsv
-
-commit_batch
-
-echo "Checkpoint Gutenberg ID: $current_id"
-echo "TXT bytes in repository: $TOTAL_BYTES"
-echo "TXT files in repository: $TOTAL_FILES"
-echo "Max Gutenberg ID discovered in source: $DISCOVERED_MAX_ID"
