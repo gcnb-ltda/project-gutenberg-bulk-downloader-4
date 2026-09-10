@@ -1,9 +1,8 @@
 {
   "collection": "Project Gutenberg Robot Harvest TXT",
-  "harvest_offset": 0,
+  "harvest_offset": 847069,
   "total_bytes_repo": 13289,
   "total_files_repo": 33,
-  "pages_processed": 0,
-  "complete": false,
-  "note": "Migrated from partial rsync scan; existing valid TXT files are preserved and skipped during harvest."
+  "pages_processed": 5,
+  "complete": false
 }
