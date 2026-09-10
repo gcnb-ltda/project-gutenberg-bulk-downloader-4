@@ -2,10 +2,6 @@ name: Import Project Gutenberg TXT - Part 4
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - '.github/workflows/import-generated-txt.yml'
-      - 'import_generated_txt.sh'
 
 permissions:
   contents: write
@@ -33,15 +29,17 @@ jobs:
       - name: Install requirements
         run: |
           sudo apt-get update
-          sudo apt-get install -y rsync python3 coreutils
+          sudo apt-get install -y python3 unzip
 
       - name: Import next TXT batch
         env:
-          RSYNC_SOURCE: 'gutenberg.pglaf.org::gutenberg'
-          RUN_TARGET_MIB: '2500'
+          RUN_TARGET_MIB: '2000'
           REPO_TARGET_GIB: '8'
-          MAX_FILE_MIB: '90'
-          PUSH_BATCH_MIB: '400'
+          MAX_TEXT_MIB: '90'
+          MAX_ZIP_MIB: '100'
+          PUSH_BATCH_MIB: '300'
+          CHECKPOINT_PAGES: '5'
+          REQUEST_DELAY_SECONDS: '2.1'
         run: |
           chmod +x import_generated_txt.sh
           ./import_generated_txt.sh
