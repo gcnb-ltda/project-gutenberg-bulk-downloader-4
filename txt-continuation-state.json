@@ -1,8 +1,9 @@
 {
-  "collection": "Project Gutenberg main TXT",
-  "last_id": 66096,
+  "collection": "Project Gutenberg Robot Harvest TXT",
+  "harvest_offset": 0,
   "total_bytes_repo": 13289,
   "total_files_repo": 33,
-  "max_discovered_id": 66096,
-  "complete": false
+  "pages_processed": 0,
+  "complete": false,
+  "note": "Migrated from partial rsync scan; existing valid TXT files are preserved and skipped during harvest."
 }
