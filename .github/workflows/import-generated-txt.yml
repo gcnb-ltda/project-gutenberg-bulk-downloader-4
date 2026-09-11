@@ -1,12 +1,7 @@
-# Robot Harvest TXT workflow v2
 name: Import Project Gutenberg TXT - Part 4
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - '.github/workflows/import-generated-txt.yml'
-      - 'import_generated_txt.sh'
 
 permissions:
   contents: write
@@ -31,21 +26,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Install requirements
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3 unzip
-
       - name: Import next TXT batch
-        env:
-          RUN_TARGET_MIB: '2000'
-          REPO_TARGET_GIB: '8'
-          MAX_TEXT_MIB: '90'
-          MAX_ZIP_MIB: '100'
-          PUSH_BATCH_MIB: '300'
-          CHECKPOINT_PAGES: '5'
-          REQUEST_DELAY_SECONDS: '2.1'
-          MAX_PAGES_PER_RUN: '40'
         run: |
           chmod +x import_generated_txt.sh
           ./import_generated_txt.sh
