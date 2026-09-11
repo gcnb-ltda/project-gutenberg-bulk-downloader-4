@@ -2,6 +2,9 @@ name: Import Project Gutenberg TXT - Part 4
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/import-generated-txt.yml'
 
 permissions:
   contents: write
@@ -27,6 +30,12 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Import next TXT batch
+        env:
+          RUN_TARGET_MIB: '1000'
+          REPO_TARGET_GIB: '8'
+          MAX_TEXT_MIB: '90'
+          PUSH_BATCH_MIB: '250'
+          REQUEST_DELAY_SECONDS: '0.15'
         run: |
           chmod +x import_generated_txt.sh
           ./import_generated_txt.sh
