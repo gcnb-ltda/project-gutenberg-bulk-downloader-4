@@ -1,0 +1,154 @@
+name: Build Pliny Volume VI PT-BR
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tmp-pliny-volume6-ptbr.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b libjpeg-dev libopenjp2-7-dev libffi-dev
+          python -m pip install --upgrade pip
+          python -m pip install argostranslate==1.11.0 beautifulsoup4 lxml weasyprint ebooklib
+
+      - name: Translate and build files
+        run: |
+          cat > /tmp/build.py <<'PY'
+          import os, re, urllib.request
+          from pathlib import Path
+          from bs4 import BeautifulSoup, NavigableString
+          import ctranslate2
+          from argostranslate import package
+          from ebooklib import epub
+          from weasyprint import HTML
+
+          work=Path('/tmp/pliny'); work.mkdir(exist_ok=True)
+          src=work/'source.html'; model=work/'translate-en_pt-1_9.argosmodel'
+          out_html=work/'pliny_ptbr.html'
+          pdf=Path(os.environ['GITHUB_WORKSPACE'])/'Historia_Natural_de_Plinio_Volume_6_PT-BR.pdf'
+          ep=Path(os.environ['GITHUB_WORKSPACE'])/'Historia_Natural_de_Plinio_Volume_6_PT-BR.epub'
+
+          def dl(url,path):
+              req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'})
+              with urllib.request.urlopen(req,timeout=180) as r, open(path,'wb') as f:
+                  while True:
+                      b=r.read(1024*1024)
+                      if not b: break
+                      f.write(b)
+
+          dl('https://www.gutenberg.org/files/62704/62704-h/62704-h.htm',src)
+          dl('https://data.argosopentech.com/argospm/v1/translate-en_pt-1_9.argosmodel',model)
+          package.install_from_path(model)
+          pkg=next(x for x in package.get_installed_packages() if x.from_code=='en' and x.to_code=='pt')
+          tok=pkg.tokenizer
+          tr=ctranslate2.Translator(str(pkg.package_path/'model'),device='cpu',compute_type='int8',inter_threads=2,intra_threads=1)
+
+          soup=BeautifulSoup(src.read_text('utf-8',errors='replace'),'lxml')
+          for x in soup.select('.pagenum'): x.decompose()
+          records=[]; uniq={}; alpha=re.compile(r'[A-Za-z]')
+          for node in soup.find_all(string=True):
+              parent=(node.parent.name or '').lower() if node.parent else ''
+              if parent in {'style','script','noscript'}: continue
+              raw=str(node)
+              if not alpha.search(raw): continue
+              m=re.match(r'^(\s*)(.*?)(\s*)$',raw,re.S)
+              if not m: continue
+              pre,core,post=m.groups(); core=core.strip()
+              if not core: continue
+              records.append((node,pre,core,post)); uniq.setdefault(core,None)
+
+          def tc(s): return len(tok.encode(s))
+          def split_safe(text,limit=220):
+              if tc(text)<=limit: return [text]
+              units=re.split(r'(?<=[.!?;:])\s+',text)
+              if len(units)==1: units=text.split()
+              parts=[]; cur=''
+              for u in units:
+                  u=u.strip()
+                  if not u: continue
+                  cand=u if not cur else cur+' '+u
+                  if tc(cand)<=limit: cur=cand; continue
+                  if cur: parts.append(cur); cur=''
+                  if tc(u)<=limit: cur=u; continue
+                  sub=''
+                  for w in u.split():
+                      cand=w if not sub else sub+' '+w
+                      if tc(cand)<=limit: sub=cand
+                      else:
+                          if sub: parts.append(sub)
+                          sub=w
+                  if sub: cur=sub
+              if cur: parts.append(cur)
+              return parts or [text]
+
+          pieces=[]; refs={}
+          for text in uniq:
+              ids=[]
+              for p in split_safe(text): ids.append(len(pieces)); pieces.append(p)
+              refs[text]=ids
+          enc=[tok.encode(x) for x in pieces]; trans=['']*len(enc)
+          for start in range(0,len(enc),2000):
+              end=min(start+2000,len(enc)); print('translate',start,end,'/',len(enc),flush=True)
+              res=tr.translate_batch(enc[start:end],max_batch_size=2048,batch_type='tokens',beam_size=1,num_hypotheses=1,replace_unknowns=True,max_input_length=256,max_decoding_length=384)
+              for j,r in enumerate(res,start): trans[j]=tok.decode(r.hypotheses[0]).strip()
+          mapping={t:' '.join(trans[i] for i in ids).strip() or t for t,ids in refs.items()}
+          mapping.update({
+            'THE NATURAL HISTORY':'A HISTÓRIA NATURAL','NATURAL HISTORY':'HISTÓRIA NATURAL',
+            'THE NATURAL HISTORY OF PLINY.':'A HISTÓRIA NATURAL DE PLÍNIO.',
+            'CONTENTS':'SUMÁRIO','WITH GENERAL INDEX.':'COM ÍNDICE GERAL.',
+            'GENERAL INDEX':'ÍNDICE GERAL','INDEX':'ÍNDICE','FOOTNOTES':'NOTAS',
+            'Chap.':'Cap.','Page':'Página','BOOK XXXII.':'LIVRO XXXII.','BOOK XXXIII.':'LIVRO XXXIII.',
+            'BOOK XXXIV.':'LIVRO XXXIV.','BOOK XXXV.':'LIVRO XXXV.','BOOK XXXVI.':'LIVRO XXXVI.','BOOK XXXVII.':'LIVRO XXXVII.'})
+          for node,pre,core,post in records: node.replace_with(NavigableString(pre+mapping.get(core,core)+post))
+          if soup.html: soup.html['lang']='pt-BR'
+          for tag in soup.find_all(attrs={'lang':'en'}): tag['lang']='pt-BR'
+          if soup.title: soup.title.string='História Natural de Plínio, Volume 6 (de 6) - Plínio, o Velho'
+          for meta in soup.find_all('meta'):
+              n=(meta.get('name') or '').lower(); p=(meta.get('property') or '').lower()
+              if n=='dc.language': meta['content']='pt-BR'
+              if n=='dc.title' or p=='og:title': meta['content']='História Natural de Plínio, Volume 6 (de 6)'
+
+          css='''body{font-family:Georgia,"Times New Roman",serif;line-height:1.42}p,li,blockquote,.footnote,td.tdl p,p.indent{text-align:justify!important;text-justify:inter-word;hyphens:auto;-webkit-hyphens:auto;orphans:3;widows:3}h1,h2,h3,.center,.tdc{text-align:center!important}.poetry,.poetry .line,pre{text-align:left!important;hyphens:none}.pagenum{display:none!important}@page{size:A5;margin:16mm 15mm 18mm 15mm}@media print{a[href]{color:inherit;text-decoration:none}.chapter,.section{break-before:page}h1{break-before:page}h2,h3{break-after:avoid}}'''
+          st=soup.new_tag('style'); st.string=css; soup.head.append(st)
+          out_html.write_text(str(soup),'utf-8')
+          HTML(filename=str(out_html),base_url='https://www.gutenberg.org/files/62704/62704-h/').write_pdf(str(pdf))
+
+          book=epub.EpubBook(); book.set_identifier('pliny-vol6-ptbr-62704'); book.set_title('História Natural de Plínio - Volume 6'); book.set_language('pt-BR'); book.add_author('Plínio, o Velho')
+          cssitem=epub.EpubItem(uid='style',file_name='styles/book.css',media_type='text/css',content=css.encode()); book.add_item(cssitem)
+          body=soup.body; chunks=[]; cur=[]; title='Início'
+          for child in list(body.children):
+              if getattr(child,'name',None)=='h2':
+                  txt=child.get_text(' ',strip=True)
+                  if re.match(r'^LIVRO\s+[XVI]+\.?',txt,re.I) and cur: chunks.append((title,cur)); cur=[]; title=txt
+              cur.append(child)
+          if cur: chunks.append((title,cur))
+          spine=[]; toc=[]
+          for i,(ttl,nodes) in enumerate(chunks,1):
+              ch=epub.EpubHtml(title=ttl or f'Seção {i}',file_name=f'text/part{i:03d}.xhtml',lang='pt-BR'); ch.content='<div>'+''.join(str(n) for n in nodes)+'</div>'; ch.add_item(cssitem); book.add_item(ch); spine.append(ch); toc.append(ch)
+          book.toc=tuple(toc); book.spine=['nav']+spine; book.add_item(epub.EpubNcx()); book.add_item(epub.EpubNav()); epub.write_epub(str(ep),book,{})
+
+          plain=soup.get_text(' ',strip=True).lower(); pt=sum(plain.count(' '+w+' ') for w in ['de','e','que','para','com','por','uma','os','as']); en=sum(plain.count(' '+w+' ') for w in ['the','and','of','with','from','that','for','was'])
+          print('markers',pt,en,'sizes',pdf.stat().st_size,ep.stat().st_size,flush=True)
+          if pdf.stat().st_size<500000 or ep.stat().st_size<250000 or pt<=en: raise RuntimeError('sanity check failed')
+          PY
+          python /tmp/build.py
+
+      - name: Upload final files
+        uses: actions/upload-artifact@v4
+        with:
+          name: pliny-volume6-ptbr-final
+          path: |
+            Historia_Natural_de_Plinio_Volume_6_PT-BR.pdf
+            Historia_Natural_de_Plinio_Volume_6_PT-BR.epub
+          retention-days: 1
+          if-no-files-found: error
